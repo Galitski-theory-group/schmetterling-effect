@@ -1,0 +1,8 @@
+.natural-quantization
+*egg*
+*__pycache__
+*.pytest*
+.brick
+*out
+*err
+data/*
