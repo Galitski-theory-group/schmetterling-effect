@@ -5,11 +5,18 @@ import qnexus as qnx
 from pytket import Circuit
 
 
-def calculate_hamming_distance_pdf(data):
+def calculate_hamming_distance_pdf(data: dict) -> tuple[list, list]:
     """
-    Docstring for calculate_hamming_distance_pdf
+    Calculates the hamming distance between number of bitstrings and
+    ground state |00..0> .
 
-    :param data: Description
+    Parameters:
+    data (dict):  Contains bitstring as key, count of bitstring as item
+
+    Returns:
+    tuple: The
+
+
     """
     distances = Counter()
     for key, item in data.items():
@@ -25,11 +32,15 @@ def calculate_hamming_distance_pdf(data):
 def validate_nexus_connection(*, nexus_hosted=True) -> bool:
     """
     Returns True if we can auth and reach Nexus (and therefore can submit jobs).
+
+    Parameters:
+    * : any argument which can be passed to 
     """
     try:
         # Use whichever login mode fits your environment:
-        # qnx.login()  # browser flow  [oai_citation:1‡docs.quantinuum.com](https://docs.quantinuum.com/nexus/trainings/notebooks/basics/getting_started.html?utm_source=chatgpt.com)
-        qnx.login_with_credentials()  # prompt-based  [oai_citation:2‡docs.quantinuum.com](https://docs.quantinuum.com/nexus/nexus_api/auth.html?utm_source=chatgpt.com)
+        # qnx.login()  # browser flow  [oai_citation:1‡docs.quantinuum.com]
+        # (https://docs.quantinuum.com/nexus/trainings/notebooks/basics/getting_started.html
+        qnx.login_with_credentials()  # prompt-based  
 
         # Smoke test: hit an endpoint that requires a working session.
         # This will fail if tokens are invalid, network is blocked, etc.
