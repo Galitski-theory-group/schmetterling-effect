@@ -46,7 +46,7 @@ _spec = importlib.util.spec_from_file_location("schmetterling", _src)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
-generate = _mod.generate_time_reversal_breaking_random_brick_wall
+generate = _mod.build_otoc_circuit
 _run_circuits = _mod._run_circuits
 compute_C_t = _mod.compute_C_t
 plot_results = _mod.plot_results
@@ -72,26 +72,35 @@ ButterflyTransferMatrix = _tm_mod.ButterflyTransferMatrix
 #     Axis 3 — measurement sites : meas_seed   = (MEAS_SEED+1)*10_000_000 + c_idx*1_000 + i_idx
 #
 DATE = f"{datetime.datetime.now():%Y_%m_%d_%H:%M:%S}"
-P_VALUES = [0.0, 0.02]  # measurement rate threshold
+P_VALUES = [0.0, 0.01]  # measurement rate threshold
 L_MAX = 20  # max layers
 N_VALUES = [6]  # system sizes (even, 8–16)
 N_REALIZATIONS = 1000  # single-shot mode: independent circuits per (N, p, L)
 N_SHOTS = 100  # multi-shot mode: shots per fixed circuit
 N_CIRCUITS = 5  # multi-shot mode: gate-angle realizations
 N_INIT_STATES = 5  # multi-shot mode: initial-state realizations
-BASE_SEED = 42  # root seed for all disorder axes
+BASE_SEED = 1917  # root seed for parallel schemes (single seed)
+BASE_SEEDS: list[int] = [
+    1,
+    10,
+    25,
+]  # seeds for sequential sweeps — add more to seed-average
 MEAS_SEED = 7  # multi-shot mode: root seed for measurement stream
 RECORD_EVERY = 4  # record at L = 5, 10, 15, 20
 L_VALUES: list[int] | None = [
     2,
-    5,
+    4,
+    6,
+    8,
     10,
     20,
-    30,
 ]  # explicit L list; overrides L_MAX + RECORD_EVERY when set
 PERT_OP = "X"  # perturbation gate
 PROBE_ANGLE = 0.0  # Ry(π/2) on probe qubit
 OPTIMISATION_LEVEL = 0  # pytket compilation level: 0 = minimal, 1 = light, 2 = full
+NEXUS_BATCH = (
+    False  # True = attempt_batching (requires org feature); False = standard queue
+)
 # DEVICE_NAME = "H2-1LE"  # uncomment for Quantinuum hardware
 DEVICE_NAME = None  # None → local AerBackend
 
@@ -99,26 +108,29 @@ DEVICE_NAME = None  # None → local AerBackend
 # All None → ideal (noiseless) simulation.  Mix and match as needed.
 # Typical H-series-class values: p1q=1e-4, p2q=1e-3, pm=5e-3
 #                                 T1=1e-3, T2=1e-3 (seconds)
-NOISE_P1Q    = None   # single-qubit gate depolarizing error rate
-NOISE_P2Q    = None   # two-qubit gate depolarizing error rate
-NOISE_PM     = None   # symmetric readout bitflip probability
-NOISE_T1     = None   # longitudinal relaxation time T1 (seconds)
-NOISE_T2     = None   # transverse relaxation time  T2 (seconds; must be <= 2*T1)
-NOISE_T_1Q   = 50e-9  # single-qubit gate duration (seconds)
-NOISE_T_2Q   = 300e-9 # two-qubit gate duration    (seconds)
-FIGURE_DIR = "../figs/"
-FIGURE_PATH_C = FIGURE_DIR + f"C_vs_t_{DATE}.png"
-FIGURE_PATH_CV = FIGURE_DIR + f"cv_vs_t_{DATE}.png"
-FIGURE_PATH_TM = FIGURE_DIR + f"qc_vs_tm_{DATE}.png"
+NOISE_P1Q = None  # single-qubit gate depolarizing error rate
+NOISE_P2Q = None  # two-qubit gate depolarizing error rate
+NOISE_PM = None  # symmetric readout bitflip probability
+NOISE_T1 = None  # longitudinal relaxation time T1 (seconds)
+NOISE_T2 = None  # transverse relaxation time  T2 (seconds; must be <= 2*T1)
+NOISE_T_1Q = 50e-9  # single-qubit gate duration (seconds)
+NOISE_T_2Q = 300e-9  # two-qubit gate duration    (seconds)
+FIGURE_DIR = pathlib.Path(__file__).parent.parent / "figs"
+FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+FIGURE_PATH_C = str(FIGURE_DIR / f"C_vs_t_{DATE}.png")
+FIGURE_PATH_CV = str(FIGURE_DIR / f"cv_vs_t_{DATE}.png")
+FIGURE_PATH_TM = str(FIGURE_DIR / f"qc_vs_tm_{DATE}.png")
 PARTIALS_DIR = "partials"  # directory for intermediate files
 
 # ── Transfer-matrix overlay  (set TM_NUM_QUBITS to None to skip entirely) ─────
-TM_NUM_QUBITS: int | None = 6      # None → TM disabled; set to an int to enable
-TM_TF: int = 30                    # number of time steps to evolve
-TM_PERT_SITE: int = 3              # perturbation qubit index
-TM_PROBE_SITE: int = 0             # probe qubit index
-TM_P_VALUES: list[float] | None = None  # None → use P_VALUES; or set explicitly e.g. [0.0, 0.02]
-TM_BC_TYPE: str = "open"           # "open" or "periodic"
+TM_NUM_QUBITS: int | None = 6  # None → TM disabled; set to an int to enable
+TM_TF: int = 25  # number of time steps to evolve
+TM_PERT_SITE: int = 2  # perturbation qubit index
+TM_PROBE_SITE: int = 0  # probe qubit index
+TM_P_VALUES: list[float] | None = (
+    None  # None → use P_VALUES; or set explicitly e.g. [0.0, 0.02]
+)
+TM_BC_TYPE: str = "open"  # "open" or "periodic"
 
 # OTOC sweep parameters (used in sequential mode and OTOC-specific runs)
 OTOC_W = N_VALUES[-1]
@@ -150,9 +162,13 @@ def _build_backend():
 
     if any(v is not None for v in (NOISE_P1Q, NOISE_P2Q, NOISE_PM, NOISE_T1, NOISE_T2)):
         noise_model = build_aer_noise_model(
-            p1q=NOISE_P1Q, p2q=NOISE_P2Q, pm=NOISE_PM,
-            T1=NOISE_T1, T2=NOISE_T2,
-            t_gate_1q=NOISE_T_1Q, t_gate_2q=NOISE_T_2Q,
+            p1q=NOISE_P1Q,
+            p2q=NOISE_P2Q,
+            pm=NOISE_PM,
+            T1=NOISE_T1,
+            T2=NOISE_T2,
+            t_gate_1q=NOISE_T_1Q,
+            t_gate_2q=NOISE_T_2Q,
         )
         print(
             f"Noisy AerBackend  p1q={NOISE_P1Q}  p2q={NOISE_P2Q}  pm={NOISE_PM}  "
@@ -567,6 +583,7 @@ def plot_tm_overlay(
         Output file path for the saved figure.
     """
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
@@ -581,25 +598,34 @@ def plot_tm_overlay(
         for n_idx, N in enumerate(N_values):
             if N not in all_stats or p not in all_stats[N]["C"]:
                 continue
-            qc_C  = [all_stats[N]["C"][p][L]  for L in L_values]
+            qc_C = [all_stats[N]["C"][p][L] for L in L_values]
             qc_se = [all_stats[N]["se"][p][L] for L in L_values]
             lw = 2.0 if N == tm_N else 0.8
             ax.errorbar(
-                L_values, qc_C, yerr=qc_se,
-                fmt="o", capsize=3, capthick=lw, elinewidth=lw,
-                color=N_colors[n_idx], label=f"QC  N={N}",
+                [L - 1 for L in L_values],
+                qc_C,
+                yerr=qc_se,
+                fmt="o",
+                capsize=3,
+                capthick=lw,
+                elinewidth=lw,
+                color=N_colors[n_idx],
+                label=f"QC  N={N}",
             )
 
         if p in tm_results:
             t_tm, C_tm = tm_results[p]
             ax.plot(
-                t_tm, C_tm,
-                "-", lw=2, color="crimson",
+                t_tm,
+                C_tm,
+                "-",
+                lw=2,
+                color="crimson",
                 label=f"TM  N={tm_N}",
                 zorder=5,
             )
 
-        ax.set_xlabel("T  (layers)")
+        ax.set_xlabel("t  (layers)")
         ax.set_ylabel(r"$C_t$")
         ax.set_title(f"p = {p:.3f}")
         ax.legend(fontsize=8)
@@ -642,13 +668,22 @@ def run_sequential(mode: str = "single_shot") -> None:
     print(f"  p_values       = {P_VALUES}")
     print(f"  L_max          = {L_MAX}   →  recorded at L = {L_steps}")
     print(f"  N_values       = {N_VALUES}")
-    print(f"  base_seed      = {BASE_SEED}")
+    print(f"  base_seeds     = {BASE_SEEDS}")
     print(f"  pert_op        = {PERT_OP!r}")
     print(f"  backend        = {backend_label!r}")
 
     if mode == "single_shot":
-        n_total = len(N_VALUES) * len(P_VALUES) * len(L_steps) * N_REALIZATIONS * 2
-        print(f"  n_realizations = {N_REALIZATIONS}")
+        n_total = (
+            len(N_VALUES)
+            * len(P_VALUES)
+            * len(L_steps)
+            * N_REALIZATIONS
+            * len(BASE_SEEDS)
+            * 2
+        )
+        print(
+            f"  n_realizations = {N_REALIZATIONS} × {len(BASE_SEEDS)} seed(s) = {N_REALIZATIONS * len(BASE_SEEDS)}"
+        )
         print(f"  Total circuits = {n_total}  (1 shot each)")
         print("=" * 64)
         all_stats = sweep_single_shot_disorder(
@@ -656,22 +691,25 @@ def run_sequential(mode: str = "single_shot") -> None:
             L_max=L_MAX,
             N_values=N_VALUES,
             n_realizations=N_REALIZATIONS,
-            base_seed=BASE_SEED,
+            base_seeds=BASE_SEEDS,
             record_every=RECORD_EVERY,
             L_values=L_steps if L_VALUES is not None else None,
             pert_op=PERT_OP,
             probe_angle=PROBE_ANGLE,
             device_name=DEVICE_NAME,
             optimisation_level=OPTIMISATION_LEVEL,
+            use_batch=NEXUS_BATCH,
         )
     elif mode == "multi_shot":
-        n_real = N_CIRCUITS * N_INIT_STATES
+        n_real = N_CIRCUITS * N_INIT_STATES * len(BASE_SEEDS)
         n_total = len(N_VALUES) * len(P_VALUES) * n_real * len(L_steps) * 2
         print(f"  n_circuits     = {N_CIRCUITS}")
         print(f"  n_init_states  = {N_INIT_STATES}")
         print(f"  n_shots        = {N_SHOTS}")
         print(f"  meas_seed      = {MEAS_SEED}")
-        print(f"  Total circuits = {n_total}  ({N_SHOTS} shots each)")
+        print(
+            f"  Total circuits = {n_total}  ({N_SHOTS} shots each, {len(BASE_SEEDS)} seed(s))"
+        )
         print("=" * 64)
         all_stats = sweep_over_all_disorder_axes(
             p_values=P_VALUES,
@@ -680,7 +718,7 @@ def run_sequential(mode: str = "single_shot") -> None:
             n_shots=N_SHOTS,
             n_circuits=N_CIRCUITS,
             n_init_states=N_INIT_STATES,
-            base_seed=BASE_SEED,
+            base_seeds=BASE_SEEDS,
             meas_seed=MEAS_SEED,
             record_every=RECORD_EVERY,
             L_values=L_steps if L_VALUES is not None else None,
@@ -688,6 +726,7 @@ def run_sequential(mode: str = "single_shot") -> None:
             probe_angle=PROBE_ANGLE,
             device_name=DEVICE_NAME,
             optimisation_level=OPTIMISATION_LEVEL,
+            use_batch=NEXUS_BATCH,
         )
     else:
         raise ValueError(

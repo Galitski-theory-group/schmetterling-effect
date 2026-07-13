@@ -188,7 +188,7 @@ _PERT_UNITARY_OPS = {"X", "Y", "Z", "H", "S", "T"}
 _INIT_PAULIS = ["X", "Y", "Z"]  # identity handled by skipping
 
 
-def generate_time_reversal_breaking_random_brick_wall(
+def build_otoc_circuit(
     L: int,
     W: int,
     unperturbed: bool = False,
@@ -202,7 +202,7 @@ def generate_time_reversal_breaking_random_brick_wall(
     init_seed: int | None = None,
     meas_seed: int | None = None,
     meas_seed_ud: int | None = None,
-    n_meas_total: int = 0,
+    p: float = 0.0,
 ) -> Circuit:
     """
     Parameters:
@@ -224,10 +224,10 @@ def generate_time_reversal_breaking_random_brick_wall(
     meas_seed_ud (int): Seed for U† measurement site selection. Independent of
     meas_seed so the forward and backward channels have uncorrelated measurement
     patterns. Defaults to meas_seed + 1 when meas_seed is given, else seed + 1.
-    n_meas_total (int): Exact number of stochastic measurements per channel
-    (U and U† each get n_meas_total independently placed measurements).
-    Distributed uniformly across L-1 eligible layers; sites chosen without
-    replacement per layer via the respective meas_rng.
+    p (float): Per-site measurement probability. Each eligible qubit in each of
+    the first L-1 layers independently draws Bernoulli(p); the final layer before
+    the perturbation is never measured. U and U† draw independently via their
+    respective meas_rngs.
 
     Returns:
     Circuit: State-prep → U → Perturbation → U† → probe measurement circuit.
@@ -268,38 +268,22 @@ def generate_time_reversal_breaking_random_brick_wall(
     # two-qubit gate that layer (paired sites). Unpaired boundary qubits (0 and
     # W-1 in odd layers) are idle and never receive stochastic measurements.
     #
-    # U and U† each receive n_meas_total measurements distributed independently:
-    # each channel gets its own floor/ceil split across L-1 eligible layers and
-    # its own random site selection within each layer. The two RNGs are seeded
-    # from meas_seed and meas_seed_ud respectively, ensuring zero correlation.
-    #
-    # Tuple layout in forward:
-    #   pairs_data[k] = (a,b,g,i,j, ai,bi,ci,aj,bj,cj, mi_u,mj_u, mi_ud,mj_ud)
-    num_eligible = max(L - 1, 0)
-
-    def _layer_counts(rng_):
-        counts = [0] * L
-        if num_eligible > 0 and n_meas_total > 0:
-            clamped = min(n_meas_total, W * num_eligible)
-            base, rem = divmod(clamped, num_eligible)
-            for rank, l in enumerate(rng_.permutation(num_eligible)):
-                counts[l] = base + (1 if rank < rem else 0)
-        return counts
-
-    layer_meas_u  = _layer_counts(meas_rng_u)
-    layer_meas_ud = _layer_counts(meas_rng_ud)
+    # Each eligible site in each of the first L-1 layers independently draws
+    # Bernoulli(p): measured with probability p, unmeasured with probability 1-p.
+    # The final layer (index L-1, directly before the perturbation) is never
+    # measured. U and U† draw independently via meas_rng_u and meas_rng_ud.
 
     forward = []
     for l in range(L):
         pairs_in_layer = layer_pairs(l)
         paired = sorted({q for pair in pairs_in_layer for q in pair})
 
-        def _pick(rng_, count):
-            n = min(count, len(paired))
-            return set(rng_.choice(len(paired), size=n, replace=False).tolist()) if n > 0 else set()
-
-        chosen_u  = {paired[k] for k in _pick(meas_rng_u,  layer_meas_u[l])}
-        chosen_ud = {paired[k] for k in _pick(meas_rng_ud, layer_meas_ud[l])}
+        if l < L - 1 and p > 0.0:
+            chosen_u  = {q for q, hit in zip(paired, meas_rng_u.random(len(paired))  < p) if hit}
+            chosen_ud = {q for q, hit in zip(paired, meas_rng_ud.random(len(paired)) < p) if hit}
+        else:
+            chosen_u  = set()
+            chosen_ud = set()
 
         pairs_data = []
         for i, j in pairs_in_layer:
@@ -386,51 +370,120 @@ def _run_circuits(
     n_shots: int,
     tags: list[str] | None = None,
     optimisation_level: int = 0,
+    nexus_project: str = "schmetterling-effect",
+    use_batch: bool = True,
 ) -> list[np.ndarray]:
     """
-    Compile and execute circuits as a single batch on `backend`.
+    Compile and execute circuits on `backend`.
 
-    All circuits are compiled and submitted together to minimise queue time.
-    The trade-off is all-or-nothing fault tolerance: a backend failure loses
-    results for every circuit in the batch.
+    For local AerBackend: compiles and runs directly via the pytket backend API.
 
-    Circuit names (shown in the Quantinuum portal and local logs) are set from
-    `tags` when provided. Auth and machine selection live on the backend object.
+    For QuantinuumBackend: goes through Nexus — uploads circuits, compiles as
+    a single compile job, then executes via qnx.start_execute_job.
+    When use_batch=True, attempt_batching=True is set so all circuits share one
+    hardware queue slot.  If your organisation does not have batching enabled,
+    set use_batch=False and the job is submitted without the batch flag.
 
     Parameters:
     circuits (list[Circuit]): Circuits to run; output order matches input order.
-    backend: Any pytket Backend (e.g. AerBackend for simulation,
-    QuantinuumBackend for hardware). Credentials and device are
-    configured on the backend object before calling this function.
+    backend: AerBackend for local simulation or QuantinuumBackend for hardware.
     n_shots (int): Shots per circuit.
-    tags (list[str]): Optional names for each circuit, one per entry in
-    circuits. Used for portal tracking and log output.
-    optimisation_level (int): pytket compilation optimisation level (0, 1, or 2).
-    0 = minimal rewriting (preserve circuit structure); 1 = light peephole
-    optimisation; 2 = full gate-count reduction. Default is 0.
+    tags (list[str]): Optional names for each circuit. Used as Nexus circuit
+    names and local log labels.
+    optimisation_level (int): pytket compilation level 0 / 1 / 2. Default 0.
+    nexus_project (str): Nexus project name (created if absent). Only used for
+    QuantinuumBackend runs.
+    use_batch (bool): Enable Nexus batching (attempt_batching=True). Requires
+    the feature to be enabled for your organisation. Set False if you receive
+    a 403 "Batching needs to be enabled" error. Default True.
 
     Returns:
-    list of np.ndarray of shape (n_shots, n_bits), one per input circuit.
+    list of np.ndarray of shape (n_shots, n_bits), one per input circuit,
+    in the same order as the input list.
     """
+    import uuid
+
     if tags is not None:
         if len(tags) != len(circuits):
             raise ValueError(f"len(tags)={len(tags)} must equal len(circuits)={len(circuits)}")
         for qc, name in zip(circuits, tags):
             qc.name = name
 
-    backend_label = getattr(backend, "device_name", type(backend).__name__)
-    tag_summary = tags[0] if tags else "unnamed"
-    print(f"[{backend_label}] compiling {len(circuits)} circuit(s)  opt={optimisation_level}  tag={tag_summary!r}")
+    _tags = tags or [f"circuit_{i}" for i in range(len(circuits))]
+    backend_label = getattr(backend, "_device_name", type(backend).__name__)
+    print(f"[{backend_label}] {len(circuits)} circuit(s)  n_shots={n_shots}  "
+          f"opt={optimisation_level}  batch={use_batch}")
 
-    compiled = [
-        backend.get_compiled_circuit(qc, optimisation_level=optimisation_level) for qc in circuits
-    ]
+    # ── Quantinuum path: compile + execute via Nexus ───────────────────────────
+    if isinstance(backend, QuantinuumBackend):
+        device_name = backend._device_name
 
-    print(f"[{backend_label}] submitting batch of {len(circuits)} circuit(s)  n_shots={n_shots}")
-    handles = backend.process_circuits(compiled, n_shots=[n_shots] * len(circuits))
+        print(f"[{backend_label}] logging into Nexus …")
+        qnx.login_with_credentials()
+        project_ref = qnx.projects.get_or_create(name=nexus_project)
 
-    print(f"[{backend_label}] waiting for results...")
-    results = [backend.get_result(h).get_shots() for h in handles]
+        print(f"[{backend_label}] uploading {len(circuits)} circuit(s) …")
+        circuit_refs = [
+            qnx.circuits.upload(circuit=qc, name=tag, project=project_ref)
+            for qc, tag in zip(circuits, _tags)
+        ]
+
+        print(f"[{backend_label}] compiling (opt={optimisation_level}) …")
+        compile_job = qnx.start_compile_job(
+            programs=circuit_refs,
+            name=f"compile_{_tags[0]}",
+            optimisation_level=optimisation_level,
+            backend_config=qnx.QuantinuumConfig(device_name=device_name),
+            project=project_ref,
+        )
+        qnx.jobs.wait_for(compile_job)
+        compiled_refs = [item.get_output() for item in qnx.jobs.results(compile_job)]
+
+        if use_batch:
+            backend_config = qnx.QuantinuumConfig(
+                device_name=device_name,
+                attempt_batching=True,
+                batch_id=uuid.uuid4(),
+            )
+            print(f"[{backend_label}] submitting batched execute job …")
+        else:
+            backend_config = qnx.QuantinuumConfig(device_name=device_name)
+            print(f"[{backend_label}] submitting execute job (no batching) …")
+
+        try:
+            execute_job = qnx.start_execute_job(
+                programs=compiled_refs,
+                n_shots=[n_shots] * len(compiled_refs),
+                backend_config=backend_config,
+                name=f"execute_{_tags[0]}",
+                project=project_ref,
+            )
+        except Exception as exc:
+            msg = str(exc)
+            if use_batch and ("403" in msg or "Batching needs to be enabled" in msg):
+                raise RuntimeError(
+                    "Batching is not enabled for your organisation (HTTP 403).\n"
+                    "Set USE_BATCH = False in the config and rerun."
+                ) from exc
+            raise
+
+        print(f"[{backend_label}] waiting for results …")
+        qnx.jobs.wait_for(execute_job)
+        results = [
+            item.download_result().get_shots()
+            for item in qnx.jobs.results(execute_job)
+        ]
+
+    # ── Local path: direct pytket backend API (AerBackend etc.) ──────────────
+    else:
+        compiled = [
+            backend.get_compiled_circuit(qc, optimisation_level=optimisation_level)
+            for qc in circuits
+        ]
+        handles = backend.process_circuits(compiled, n_shots=[n_shots] * len(compiled))
+        print(f"[{backend_label}] waiting for results …")
+        results = [backend.get_result(h).get_shots() for h in handles]
+
     print(f"[{backend_label}] done — {len(results)} result(s) received")
     return results
 
@@ -544,6 +597,7 @@ def sweep_over_all_disorder_axes(
     n_circuits: int = 3,
     n_init_states: int = 3,
     base_seed: int = 42,
+    base_seeds: list[int] | None = None,
     meas_seed: int | None = None,
     record_every: int = 5,
     L_values: list[int] | None = None,
@@ -554,6 +608,7 @@ def sweep_over_all_disorder_axes(
     backend=None,
     device_name: str | None = None,
     optimisation_level: int = 0,
+    use_batch: bool = True,
 ) -> dict[int, dict[str, dict[float, dict[int, float]]]]:
     """
     Top-level controller: disorder-averaged sweep over (p, T, N).
@@ -571,10 +626,12 @@ def sweep_over_all_disorder_axes(
     n_shots (int): Shots per circuit per variant.
     n_circuits (int): Independent gate-angle realizations per (p, N).
     n_init_states (int): Initial Pauli-word realizations per circuit realization.
-    base_seed (int): Root seed; circuit and init seeds are derived from it.
-    meas_seed (int): Root seed for per-realization measurement uniforms so that
-    p acts as a pure threshold. Defaults to base_seed + 1 to keep the
-    three disorder axes (gates, init, meas) independent.
+    base_seed (int): Root seed used when base_seeds is None.
+    base_seeds (list[int]): List of root seeds to average over. Each seed
+    contributes n_circuits × n_init_states independent realizations; results
+    are concatenated before computing statistics. Overrides base_seed when set.
+    meas_seed (int): Root seed for measurement site selection. Defaults to
+    base_seed + 1 (or _seed + 1 for each seed in base_seeds).
     record_every (int): Only record/execute at L = record_every, 2*record_every, ...
     Ignored when L_values is provided.
     L_values (list[int]): Explicit list of layer counts to evaluate (e.g. [1,2,5,10,25]).
@@ -606,7 +663,9 @@ def sweep_over_all_disorder_axes(
 
     if L_values is None:
         L_values = list(range(record_every, L_max + 1, record_every))
-    _meas_base = meas_seed if meas_seed is not None else base_seed + 1
+
+    _seeds = base_seeds if base_seeds is not None else [base_seed]
+    print(f"Seed average over {len(_seeds)} seed(s): {_seeds}")
 
     all_stats: dict[int, dict] = {}
 
@@ -617,55 +676,49 @@ def sweep_over_all_disorder_axes(
             p: {L: [] for L in L_values} for p in p_values
         }
 
+        for _seed in _seeds:
+            _meas_base = meas_seed if meas_seed is not None else _seed + 1
+
+            for p in p_values:
+                for c_idx in range(n_circuits):
+                    circuit_seed = _seed * 10_000 + c_idx
+                    for i_idx in range(n_init_states):
+                        init_seed_val    = _seed * 10_000_000 + c_idx * 1_000 + i_idx
+                        meas_seed_u_val  = _meas_base * 10_000_000 + c_idx * 1_000 + i_idx
+                        meas_seed_ud_val = (_meas_base + 1) * 10_000_000 + c_idx * 1_000 + i_idx
+
+                        for L in L_values:
+                            shared_kwargs = dict(
+                                L=L, W=W,
+                                pert_site=_pert_site, pert_op=pert_op,
+                                probe_site=_probe_site, probe_angle=probe_angle,
+                                p=p,
+                                seed=circuit_seed, init_seed=init_seed_val,
+                                meas_seed=meas_seed_u_val, meas_seed_ud=meas_seed_ud_val,
+                                add_barrier=_add_barrier,
+                            )
+                            qc_pert   = build_otoc_circuit(**shared_kwargs, unperturbed=False)
+                            qc_unpert = build_otoc_circuit(**shared_kwargs, unperturbed=True)
+                            probe_bit = qc_pert.n_bits - 1
+
+                            tag_base = f"N{W}_p{p:.2f}_L{L:03d}_s{_seed}_c{c_idx}_i{i_idx}"
+                            shots_p, shots_u = _run_circuits(
+                                [qc_pert, qc_unpert], backend, n_shots,
+                                tags=[f"{tag_base}_pert", f"{tag_base}_unpert"],
+                                optimisation_level=optimisation_level,
+                                use_batch=use_batch,
+                            )
+
+                            out_p = 1 - 2 * shots_p[:, probe_bit].astype(int)
+                            out_u = 1 - 2 * shots_u[:, probe_bit].astype(int)
+                            raw[p][L].append(out_u.mean() - out_p.mean())
+                            print(
+                                f"N={W:2d}  p={p:.2f}  L={L:3d}  "
+                                f"seed={_seed}  c={c_idx}  i={i_idx}  "
+                                f"C_t={raw[p][L][-1]:.4f}"
+                            )
+
         for p in p_values:
-            for c_idx in range(n_circuits):
-                circuit_seed = base_seed * 10_000 + c_idx
-                for i_idx in range(n_init_states):
-                    init_seed_val = base_seed * 10_000_000 + c_idx * 1_000 + i_idx
-                    meas_seed_u_val  = _meas_base * 10_000_000 + c_idx * 1_000 + i_idx
-                    meas_seed_ud_val = (_meas_base + 1) * 10_000_000 + c_idx * 1_000 + i_idx
-
-                    for L in L_values:
-                        n_meas_total = min(round(p * W * L), W * max(L - 1, 0))
-                        shared_kwargs = dict(
-                            L=L,
-                            W=W,
-                            pert_site=_pert_site,
-                            pert_op=pert_op,
-                            probe_site=_probe_site,
-                            probe_angle=probe_angle,
-                            n_meas_total=n_meas_total,
-                            seed=circuit_seed,
-                            init_seed=init_seed_val,
-                            meas_seed=meas_seed_u_val,
-                            meas_seed_ud=meas_seed_ud_val,
-                            add_barrier=_add_barrier,
-                        )
-                        qc_pert = generate_time_reversal_breaking_random_brick_wall(
-                            **shared_kwargs, unperturbed=False
-                        )
-                        qc_unpert = generate_time_reversal_breaking_random_brick_wall(
-                            **shared_kwargs, unperturbed=True
-                        )
-                        probe_bit = qc_pert.n_bits - 1
-
-                        tag_base = f"N{W}_p{p:.2f}_L{L:03d}_c{c_idx}_i{i_idx}"
-                        shots_p, shots_u = _run_circuits(
-                            [qc_pert, qc_unpert],
-                            backend,
-                            n_shots,
-                            tags=[f"{tag_base}_pert", f"{tag_base}_unpert"],
-                            optimisation_level=optimisation_level,
-                        )
-
-                        out_p = 1 - 2 * shots_p[:, probe_bit].astype(int)
-                        out_u = 1 - 2 * shots_u[:, probe_bit].astype(int)
-                        raw[p][L].append(out_u.mean() - out_p.mean())
-                        print(
-                            f"N={W:2d}  p={p:.2f}  L={L:3d}  "
-                            f"c={c_idx}  i={i_idx}  C_t={raw[p][L][-1]:.4f}"
-                        )
-
             for L in L_values:
                 raw[p][L] = np.array(raw[p][L])
 
@@ -680,6 +733,7 @@ def sweep_single_shot_disorder(
     N_values: list[int] | None = None,
     n_realizations: int = 400,
     base_seed: int = 42,
+    base_seeds: list[int] | None = None,
     record_every: int = 5,
     L_values: list[int] | None = None,
     pert_site: int | None = None,
@@ -689,6 +743,7 @@ def sweep_single_shot_disorder(
     backend=None,
     device_name: str | None = None,
     optimisation_level: int = 0,
+    use_batch: bool = True,
 ) -> dict[int, dict[str, dict[float, dict[int, float]]]]:
     """
     Disorder-averaged sweep where every sample is a fully independent circuit
@@ -705,12 +760,16 @@ def sweep_single_shot_disorder(
     L_max (int): Maximum number of layers (time steps).
     N_values (list[int]): System sizes (must be even). Defaults to [8..16 step 2].
     n_realizations (int): Number of independent circuit configurations per
-    (N, p, L) grid point. Total circuits per point = 2 * n_realizations.
-    base_seed (int): Root seed. Per-realization seeds:
-    gate angles   → (base_seed + 0) * 10_000_000 + r
-    initial state → (base_seed + 1) * 10_000_000 + r
-    U meas sites  → (base_seed + 2) * 10_000_000 + r
-    U† meas sites → (base_seed + 3) * 10_000_000 + r
+    (N, p, L) grid point, per seed. Total realizations = n_realizations × len(base_seeds).
+    base_seed (int): Root seed used when base_seeds is None.
+    base_seeds (list[int]): List of root seeds to average over. Each seed
+    contributes n_realizations independent (out_u − out_p) samples; arrays are
+    concatenated before computing statistics. Overrides base_seed when set.
+    Per-realization seeds for each _seed in base_seeds:
+    gate angles   → (_seed + 0) * 10^9 + L * n_realizations + r
+    initial state → (_seed + 1) * 10^9 + L * n_realizations + r
+    U meas sites  → (_seed + 2) * 10^9 + L * n_realizations + r
+    U† meas sites → (_seed + 3) * 10^9 + L * n_realizations + r
     record_every (int): Only record/execute at L = record_every, 2*record_every, ...
     Ignored when L_values is provided.
     L_values (list[int]): Explicit list of layer counts to evaluate (e.g. [1,2,5,10,25]).
@@ -737,65 +796,61 @@ def sweep_single_shot_disorder(
 
     if L_values is None:
         L_values = list(range(record_every, L_max + 1, record_every))
+
+    _seeds = base_seeds if base_seeds is not None else [base_seed]
+    print(f"Seed average over {len(_seeds)} seed(s): {_seeds}")
+
     all_stats: dict[int, dict] = {}
 
     for W in N_values:
         _pert_site = pert_site if pert_site is not None else W // 2
         _probe_site = probe_site if probe_site is not None else 0
-        raw: dict[float, dict[int, np.ndarray]] = {}
+        raw: dict[float, dict[int, list]] = {p: {L: [] for L in L_values} for p in p_values}
+
+        for _seed in _seeds:
+            for p in p_values:
+                for L in L_values:
+                    circuits_pert, circuits_unpert = [], []
+                    for r in range(n_realizations):
+                        # Each (seed, r, L) triple draws a completely fresh
+                        # disorder instance — no overlap across seeds or depths.
+                        def _s(axis, s=_seed):
+                            return (s + axis) * 1_000_000_000 + L * n_realizations + r
+                        kwargs = dict(
+                            L=L, W=W,
+                            pert_site=_pert_site, pert_op=pert_op,
+                            probe_site=_probe_site, probe_angle=probe_angle,
+                            p=p,
+                            seed=_s(0), init_seed=_s(1),
+                            meas_seed=_s(2), meas_seed_ud=_s(3),
+                            add_barrier=_add_barrier,
+                        )
+                        circuits_pert.append(build_otoc_circuit(**kwargs, unperturbed=False))
+                        circuits_unpert.append(build_otoc_circuit(**kwargs, unperturbed=True))
+
+                    probe_bit = circuits_pert[0].n_bits - 1
+                    tag = f"N{W}_p{p:.2f}_L{L:03d}_s{_seed}"
+                    all_shots = _run_circuits(
+                        circuits_pert + circuits_unpert,
+                        backend, 1,
+                        tags=[f"{tag}_r{r}_pert"   for r in range(n_realizations)]
+                           + [f"{tag}_r{r}_unpert" for r in range(n_realizations)],
+                        optimisation_level=optimisation_level,
+                        use_batch=use_batch,
+                    )
+
+                    out_p = np.array([1 - 2 * int(s[0, probe_bit]) for s in all_shots[:n_realizations]])
+                    out_u = np.array([1 - 2 * int(s[0, probe_bit]) for s in all_shots[n_realizations:]])
+                    raw[p][L].extend((out_u - out_p).tolist())
+                    print(
+                        f"N={W:2d}  p={p:.2f}  L={L:3d}  seed={_seed}  "
+                        f"C_t={(out_u - out_p).mean():.4f}  "
+                        f"n_total={len(raw[p][L])}"
+                    )
 
         for p in p_values:
-            raw[p] = {}
             for L in L_values:
-                n_meas = min(round(p * W * L), W * max(L - 1, 0))
-
-                circuits_pert, circuits_unpert = [], []
-                for r in range(n_realizations):
-                    # Include L in the seed so each (r, L) point draws a
-                    # completely fresh disorder instance — circuits at different
-                    # depths share no angles, initial state, or measurement sites.
-                    def _s(axis):
-                        return (base_seed + axis) * 1_000_000_000 + L * n_realizations + r
-                    kwargs = dict(
-                        L=L,
-                        W=W,
-                        pert_site=_pert_site,
-                        pert_op=pert_op,
-                        probe_site=_probe_site,
-                        probe_angle=probe_angle,
-                        n_meas_total=n_meas,
-                        seed=_s(0),
-                        init_seed=_s(1),
-                        meas_seed=_s(2),
-                        meas_seed_ud=_s(3),
-                        add_barrier=_add_barrier,
-                    )
-                    circuits_pert.append(
-                        generate_time_reversal_breaking_random_brick_wall(
-                            **kwargs, unperturbed=False
-                        )
-                    )
-                    circuits_unpert.append(
-                        generate_time_reversal_breaking_random_brick_wall(
-                            **kwargs, unperturbed=True
-                        )
-                    )
-
-                probe_bit = circuits_pert[0].n_bits - 1
-                tag = f"N{W}_p{p:.2f}_L{L:03d}"
-                all_shots = _run_circuits(
-                    circuits_pert + circuits_unpert,
-                    backend,
-                    1,
-                    tags=[f"{tag}_r{r}_pert"   for r in range(n_realizations)]
-                       + [f"{tag}_r{r}_unpert" for r in range(n_realizations)],
-                    optimisation_level=optimisation_level,
-                )
-
-                out_p = np.array([1 - 2 * int(s[0, probe_bit]) for s in all_shots[:n_realizations]])
-                out_u = np.array([1 - 2 * int(s[0, probe_bit]) for s in all_shots[n_realizations:]])
-                raw[p][L] = out_u - out_p
-                print(f"N={W:2d}  p={p:.2f}  L={L:3d}  C_t={raw[p][L].mean():.4f}")
+                raw[p][L] = np.array(raw[p][L])
 
         all_stats[W] = compute_C_t(raw)
 
@@ -985,10 +1040,10 @@ def plot_results(
 #                             meas_seed=meas_seed_val,
 #                             add_barrier=_add_barrier,
 #                         )
-#                         qc_pert = generate_time_reversal_breaking_random_brick_wall(
+#                         qc_pert = build_otoc_circuit(
 #                             **shared_kwargs, unperturbed=False
 #                         )
-#                         qc_unpert = generate_time_reversal_breaking_random_brick_wall(
+#                         qc_unpert = build_otoc_circuit(
 #                             **shared_kwargs, unperturbed=True
 #                         )
 #                         probe_bit = qc_pert.n_bits - 1
