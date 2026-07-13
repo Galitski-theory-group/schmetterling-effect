@@ -188,7 +188,135 @@ _PERT_UNITARY_OPS = {"X", "Y", "Z", "H", "S", "T"}
 _INIT_PAULIS = ["X", "Y", "Z"]  # identity handled by skipping
 
 
-def build_otoc_circuit(
+def _build_otoc_circuit_impl(
+    layer_pairs_fn,
+    L: int,
+    W: int,
+    unperturbed: bool,
+    pert_site: int,
+    pert_op: str,
+    probe_site: int,
+    probe_angle: float,
+    add_barrier: bool,
+    do_reset: bool,
+    seed,
+    init_seed,
+    meas_seed,
+    meas_seed_ud,
+    p: float,
+) -> Circuit:
+    """Shared implementation for brickwall and bowtie OTOC circuits.
+
+    layer_pairs_fn(l) -> list[(i,j)]  defines which qubit pairs gate layer l.
+    All other parameters are identical to the public build_* functions.
+    """
+    rng = np.random.default_rng(seed=seed)
+    init_rng = np.random.default_rng(seed=init_seed if init_seed is not None else seed)
+    _ms_u = meas_seed if meas_seed is not None else seed
+    _ms_ud = meas_seed_ud if meas_seed_ud is not None else (_ms_u + 1 if _ms_u is not None else 1)
+    meas_rng_u  = np.random.default_rng(seed=_ms_u)
+    meas_rng_ud = np.random.default_rng(seed=_ms_ud)
+
+    # Stochastic measurements use Bernoulli(p) per eligible site per layer.
+    # The final layer of U (index L-1, directly before the perturbation) is
+    # never measured. U and U† draw independently via their own RNGs.
+    forward = []
+    for l in range(L):
+        pairs_in_layer = layer_pairs_fn(l)
+        paired = sorted({q for pair in pairs_in_layer for q in pair})
+
+        if l < L - 1 and p > 0.0 and paired:
+            chosen_u  = {q for q, hit in zip(paired, meas_rng_u.random(len(paired))  < p) if hit}
+            chosen_ud = {q for q, hit in zip(paired, meas_rng_ud.random(len(paired)) < p) if hit}
+        else:
+            chosen_u  = set()
+            chosen_ud = set()
+
+        pairs_data = []
+        for i, j in pairs_in_layer:
+            pre_i, pre_j, tk2, post_i, post_j = _haar_su4_params(rng)
+            pairs_data.append((pre_i, pre_j, tk2, post_i, post_j, i, j,
+                                i in chosen_u,  j in chosen_u,
+                                i in chosen_ud, j in chosen_ud))
+        forward.append(pairs_data)
+
+    # bit 0 : scratch — receives every mid-circuit measurement (outcomes discarded)
+    # bit 1 : probe — final readout only
+    qc = Circuit(W, 2)
+    barrier_sequence = list(range(W))
+    all_bits = [0, 1]
+
+    # State preparation: probe_site → Ry(probe_angle·π); all others → random Pauli.
+    qc.Ry(probe_angle, probe_site)
+    for q in range(W):
+        if q == probe_site:
+            continue
+        op = init_rng.choice(["I"] + _INIT_PAULIS)
+        if op != "I":
+            getattr(qc, op)(q)
+
+    # Build U: Haar SU(4) decomposed as TK1·TK2·TK1, then stochastic measurements.
+    for pairs_data in forward:
+        for pre_i, pre_j, tk2, post_i, post_j, i, j, mi_u, mj_u, _, _ in pairs_data:
+            qc.TK1(*pre_i, i); qc.TK1(*pre_j, j)
+            qc.TK2(*tk2, i, j)
+            qc.TK1(*post_i, i); qc.TK1(*post_j, j)
+            if mi_u: qc.Measure(i, 0)
+            if mj_u: qc.Measure(j, 0)
+        if add_barrier:
+            qc.add_barrier(qubits=barrier_sequence, bits=all_bits)
+
+    # Mid-circuit perturbation (suppressed when unperturbed=True).
+    if not unperturbed:
+        if pert_op == "measure":
+            qc.Measure(pert_site, 0)
+            if do_reset:
+                qc.Reset(pert_site)
+        else:
+            getattr(qc, pert_op)(pert_site)
+
+    if add_barrier:
+        qc.add_barrier(qubits=barrier_sequence, bits=all_bits)
+
+    # Apply U†: reverse layer order, negate all TK1/TK2 angles.
+    # TK1(a,b,c)† = TK1(-c,-b,-a);  TK2(t1,t2,t3)† = TK2(-t1,-t2,-t3)
+    for pairs_data in reversed(forward):
+        for pre_i, pre_j, tk2, post_i, post_j, i, j, _, _, mi_ud, mj_ud in reversed(pairs_data):
+            qc.TK1(-post_i[2], -post_i[1], -post_i[0], i)
+            qc.TK1(-post_j[2], -post_j[1], -post_j[0], j)
+            qc.TK2(-tk2[0], -tk2[1], -tk2[2], i, j)
+            qc.TK1(-pre_i[2], -pre_i[1], -pre_i[0], i)
+            qc.TK1(-pre_j[2], -pre_j[1], -pre_j[0], j)
+            if mj_ud: qc.Measure(j, 0)
+            if mi_ud: qc.Measure(i, 0)
+        if add_barrier:
+            qc.add_barrier(qubits=barrier_sequence, bits=all_bits)
+
+    qc.Measure(probe_site, 1)
+    return qc
+
+
+def _otoc_circuit_args(
+    L, W, unperturbed, pert_site, pert_op, probe_site, probe_angle,
+    add_barrier, do_reset, seed, init_seed, meas_seed, meas_seed_ud, p,
+):
+    """Validate and resolve defaults shared by all build_*_otoc_circuit functions."""
+    if pert_op != "measure" and pert_op not in _PERT_UNITARY_OPS:
+        raise ValueError(
+            f"Unsupported pert_op {pert_op!r}. Use 'measure' or one of {_PERT_UNITARY_OPS}."
+        )
+    if W % 2 != 0:
+        raise ValueError("Circuit only defined for even # of qubits.")
+    if pert_site is None:
+        pert_site = W // 2
+    if probe_site is None:
+        probe_site = 0
+    if probe_site == pert_site:
+        raise ValueError(f"probe_site and pert_site must differ (both are {probe_site}).")
+    return pert_site, probe_site
+
+
+def build_brickwall_otoc_circuit(
     L: int,
     W: int,
     unperturbed: bool = False,
@@ -204,59 +332,22 @@ def build_otoc_circuit(
     meas_seed_ud: int | None = None,
     p: float = 0.0,
 ) -> Circuit:
+    """Loschmidt-echo OTOC circuit with a standard alternating brick-wall layout.
+
+    Even layers pair qubits (0,1),(2,3),(4,5),…
+    Odd  layers pair qubits (1,2),(3,4),(5,6),…
+
+    U (L layers) is followed by the perturbation at pert_site and then U†
+    (same L layers in reverse with negated angles).  Mid-circuit measurements
+    are placed independently in U and U† via Bernoulli(p) per eligible site per
+    layer (the last layer before the perturbation is never measured).
+
+    Parameters mirror build_bowtie_otoc_circuit — see that docstring for details.
     """
-    Parameters:
-    L (int): The length of circuit or number of layers.
-    W (int): The width of the circuit or number of qubits.
-    unperturbed (bool): When True the mid-circuit perturbation is suppressed;
-    stochastic measurements are unaffected.
-    pert_site (int): Qubit index where the mid-circuit perturbation is inserted.
-    Defaults to W // 2.
-    pert_op (str): Operation applied at pert_site when unperturbed=False.
-    Use "measure" for a projective measurement or any single-qubit gate name
-    supported by pytket Circuit (e.g. "X", "Y", "Z", "H", "S", "T").
-    probe_site (int): Qubit prepared in an equal superposition before U and
-    measured after U†. Must differ from pert_site. Defaults to 0.
-    probe_angle (float): Ry rotation angle (in pytket half-turns, i.e. units of π)
-    applied to probe_site during state preparation. 0.5 → Ry(π/2), -0.5 → Ry(-π/2).
-    do_reset (bool): After a "measure" perturbation, reset the qubit to |0>.
-    meas_seed (int): Seed for U measurement site selection.
-    meas_seed_ud (int): Seed for U† measurement site selection. Independent of
-    meas_seed so the forward and backward channels have uncorrelated measurement
-    patterns. Defaults to meas_seed + 1 when meas_seed is given, else seed + 1.
-    p (float): Per-site measurement probability. Each eligible qubit in each of
-    the first L-1 layers independently draws Bernoulli(p); the final layer before
-    the perturbation is never measured. U and U† draw independently via their
-    respective meas_rngs.
-
-    Returns:
-    Circuit: State-prep → U → Perturbation → U† → probe measurement circuit.
-
-    """
-
-    if pert_op != "measure" and pert_op not in _PERT_UNITARY_OPS:
-        raise ValueError(
-            f"Unsupported pert_op {pert_op!r}. Use 'measure' or one of {_PERT_UNITARY_OPS}."
-        )
-
-    if W % 2 != 0:
-        raise ValueError("Circuit only defined for even # of qubits.")
-
-    rng = np.random.default_rng(seed=seed)
-    init_rng = np.random.default_rng(seed=init_seed if init_seed is not None else seed)
-    _ms_u = meas_seed if meas_seed is not None else seed
-    _ms_ud = meas_seed_ud if meas_seed_ud is not None else (_ms_u + 1 if _ms_u is not None else 1)
-    meas_rng_u = np.random.default_rng(seed=_ms_u)
-    meas_rng_ud = np.random.default_rng(seed=_ms_ud)
-
-    if pert_site is None:
-        pert_site = W // 2
-    if probe_site is None:
-        probe_site = 0
-    if probe_site == pert_site:
-        raise ValueError(
-            f"probe_site and pert_site must differ (both are {probe_site})."
-        )
+    pert_site, probe_site = _otoc_circuit_args(
+        L, W, unperturbed, pert_site, pert_op, probe_site, probe_angle,
+        add_barrier, do_reset, seed, init_seed, meas_seed, meas_seed_ud, p,
+    )
 
     def layer_pairs(l):
         if l % 2 == 0:
@@ -264,105 +355,87 @@ def build_otoc_circuit(
         else:
             return [(2 * w + 1, 2 * w + 2) for w in range(W // 2 - 1)]
 
-    # Stochastic measurements are placed only on qubits that participate in a
-    # two-qubit gate that layer (paired sites). Unpaired boundary qubits (0 and
-    # W-1 in odd layers) are idle and never receive stochastic measurements.
-    #
-    # Each eligible site in each of the first L-1 layers independently draws
-    # Bernoulli(p): measured with probability p, unmeasured with probability 1-p.
-    # The final layer (index L-1, directly before the perturbation) is never
-    # measured. U and U† draw independently via meas_rng_u and meas_rng_ud.
+    return _build_otoc_circuit_impl(
+        layer_pairs, L, W, unperturbed, pert_site, pert_op, probe_site,
+        probe_angle, add_barrier, do_reset, seed, init_seed, meas_seed, meas_seed_ud, p,
+    )
 
-    forward = []
-    for l in range(L):
-        pairs_in_layer = layer_pairs(l)
-        paired = sorted({q for pair in pairs_in_layer for q in pair})
 
-        if l < L - 1 and p > 0.0:
-            chosen_u  = {q for q, hit in zip(paired, meas_rng_u.random(len(paired))  < p) if hit}
-            chosen_ud = {q for q, hit in zip(paired, meas_rng_ud.random(len(paired)) < p) if hit}
-        else:
-            chosen_u  = set()
-            chosen_ud = set()
+def build_bowtie_otoc_circuit(
+    L: int,
+    W: int,
+    unperturbed: bool = False,
+    pert_site: int | None = None,
+    pert_op: str = "measure",
+    probe_site: int | None = None,
+    probe_angle: float = 0.5,
+    add_barrier: bool = True,
+    do_reset: bool = False,
+    seed: int | None = None,
+    init_seed: int | None = None,
+    meas_seed: int | None = None,
+    meas_seed_ud: int | None = None,
+    p: float = 0.0,
+) -> Circuit:
+    """Loschmidt-echo OTOC circuit with a converging-diamond (bowtie) layout.
 
-        pairs_data = []
-        for i, j in pairs_in_layer:
-            pre_i, pre_j, tk2, post_i, post_j = _haar_su4_params(rng)
-            pairs_data.append((pre_i, pre_j, tk2, post_i, post_j, i, j,
-                                i in chosen_u, j in chosen_u,
-                                i in chosen_ud, j in chosen_ud))
+    Layer l of U activates only qubits in the range [l, W-1-l], so the active
+    region shrinks by one qubit on each side every layer:
 
-        forward.append(pairs_data)
+        l=0 (W=8):  (0,1),(2,3),(4,5),(6,7)   — full width
+        l=1:        (1,2),(3,4),(5,6)
+        l=2:        (2,3),(4,5)
+        l=3:        (3,4)                       — single central pair
+        l≥4:        (empty)
 
-    # bit 0 : scratch — receives every mid-circuit measurement (outcomes discarded)
-    # bit 1 : probe — final readout only
-    n_bits = 2
-    probe_bit = 1
-    qc = Circuit(W, n_bits)
+    U† applies the same layers in reverse order, so U converges toward the
+    center while U† diverges back out — together they look like a bowtie or
+    diamond when drawn as a spacetime diagram.
 
-    barrier_sequence = list(range(W))
-    all_bits = list(range(n_bits))
+    For L > W//2 the extra layers simply have no gates (the diamond has closed).
+    The maximum meaningful depth is W//2.
 
-    # --- State preparation ---
-    # probe_site → equal superposition via Ry; all other sites → random {I, X, Y, Z}.
-    qc.Ry(probe_angle, probe_site)
-    for q in range(W):
-        if q == probe_site:
-            continue
-        op = init_rng.choice(["I"] + _INIT_PAULIS)
-        if op != "I":
-            getattr(qc, op)(q)
+    Parameters:
+    L (int): Number of layers per channel (U and U† each get L layers).
+    W (int): Number of qubits (must be even).
+    unperturbed (bool): Suppress the mid-circuit perturbation (keep measurements).
+    pert_site (int): Qubit for the perturbation; defaults to W//2 (0-indexed).
+    pert_op (str): "measure" or any pytket single-qubit gate ("X","Y","Z","H","S","T").
+    probe_site (int): Qubit read out at the end; defaults to 0. Must ≠ pert_site.
+    probe_angle (float): Ry half-turns applied to probe_site during state prep.
+    add_barrier (bool): Insert barriers between layers (required for Quantinuum).
+    do_reset (bool): Reset pert_site after a "measure" perturbation.
+    seed (int): RNG seed for Haar-random gate angles.
+    init_seed (int): RNG seed for the initial random Pauli word.
+    meas_seed (int): RNG seed for U measurement site selection.
+    meas_seed_ud (int): RNG seed for U† measurement site selection.
+    p (float): Per-site Bernoulli measurement probability in layers 0..L-2.
 
-    # Build U: Haar SU(4) via native TK1+TK2 gates, then U-channel measurements.
-    # TK1(a,b,c) = Rz(aπ)·Rx(bπ)·Rz(cπ);  TK2 = KAK interaction term.
-    # Unpaired boundary qubits are idle in odd layers and never measured.
-    # All mid-circuit outcomes go to scratch bit 0 (overwritten, never read back).
-    for pairs_data in forward:
-        for pre_i, pre_j, tk2, post_i, post_j, i, j, mi_u, mj_u, _, _ in pairs_data:
-            qc.TK1(*pre_i, i)
-            qc.TK1(*pre_j, j)
-            qc.TK2(*tk2, i, j)
-            qc.TK1(*post_i, i)
-            qc.TK1(*post_j, j)
-            if mi_u:
-                qc.Measure(i, 0)
-            if mj_u:
-                qc.Measure(j, 0)
-        if add_barrier:
-            qc.add_barrier(qubits=barrier_sequence, bits=all_bits)
+    Returns:
+    Circuit: State-prep → U (bowtie, converging) → Perturbation →
+             U† (bowtie, diverging) → probe measurement.
+    """
+    pert_site, probe_site = _otoc_circuit_args(
+        L, W, unperturbed, pert_site, pert_op, probe_site, probe_angle,
+        add_barrier, do_reset, seed, init_seed, meas_seed, meas_seed_ud, p,
+    )
 
-    # Mid-circuit perturbation (toggled off when unperturbed=True).
-    if not unperturbed:
-        if pert_op == "measure":
-            qc.Measure(pert_site, 0)
-            if do_reset:
-                qc.Reset(pert_site)
-        else:
-            getattr(qc, pert_op)(pert_site)
+    def layer_pairs(l):
+        # Active range [l, W-1-l] shrinks by 1 from each boundary every layer.
+        # Pairs start at index l so offset naturally alternates even/odd with l.
+        lo, hi = l, W - 1 - l
+        if lo >= hi:
+            return []
+        return [(a, a + 1) for a in range(lo, hi, 2) if a + 1 <= hi]
 
-    if add_barrier:
-        qc.add_barrier(qubits=barrier_sequence, bits=all_bits)
+    return _build_otoc_circuit_impl(
+        layer_pairs, L, W, unperturbed, pert_site, pert_op, probe_site,
+        probe_angle, add_barrier, do_reset, seed, init_seed, meas_seed, meas_seed_ud, p,
+    )
 
-    # Apply U†: reverse layer order, negate all angles.
-    # TK1(a,b,c)† = TK1(-c,-b,-a);  TK2(t1,t2,t3)† = TK2(-t1,-t2,-t3)
-    for pairs_data in reversed(forward):
-        for pre_i, pre_j, tk2, post_i, post_j, i, j, _, _, mi_ud, mj_ud in reversed(pairs_data):
-            qc.TK1(-post_i[2], -post_i[1], -post_i[0], i)
-            qc.TK1(-post_j[2], -post_j[1], -post_j[0], j)
-            qc.TK2(-tk2[0], -tk2[1], -tk2[2], i, j)
-            qc.TK1(-pre_i[2], -pre_i[1], -pre_i[0], i)
-            qc.TK1(-pre_j[2], -pre_j[1], -pre_j[0], j)
-            if mj_ud:
-                qc.Measure(j, 0)
-            if mi_ud:
-                qc.Measure(i, 0)
-        if add_barrier:
-            qc.add_barrier(qubits=barrier_sequence, bits=all_bits)
 
-    # Final probe measurement.
-    qc.Measure(probe_site, probe_bit)
-
-    return qc
+# Backwards-compatible alias — sweep functions use this name.
+build_otoc_circuit = build_brickwall_otoc_circuit
 
 def _run_circuits(
     circuits: list[Circuit],
@@ -609,6 +682,7 @@ def sweep_over_all_disorder_axes(
     device_name: str | None = None,
     optimisation_level: int = 0,
     use_batch: bool = True,
+    circuit_builder=None,
 ) -> dict[int, dict[str, dict[float, dict[int, float]]]]:
     """
     Top-level controller: disorder-averaged sweep over (p, T, N).
@@ -664,6 +738,7 @@ def sweep_over_all_disorder_axes(
     if L_values is None:
         L_values = list(range(record_every, L_max + 1, record_every))
 
+    _build_circuit = circuit_builder if circuit_builder is not None else build_brickwall_otoc_circuit
     _seeds = base_seeds if base_seeds is not None else [base_seed]
     print(f"Seed average over {len(_seeds)} seed(s): {_seeds}")
 
@@ -697,8 +772,8 @@ def sweep_over_all_disorder_axes(
                                 meas_seed=meas_seed_u_val, meas_seed_ud=meas_seed_ud_val,
                                 add_barrier=_add_barrier,
                             )
-                            qc_pert   = build_otoc_circuit(**shared_kwargs, unperturbed=False)
-                            qc_unpert = build_otoc_circuit(**shared_kwargs, unperturbed=True)
+                            qc_pert   = _build_circuit(**shared_kwargs, unperturbed=False)
+                            qc_unpert = _build_circuit(**shared_kwargs, unperturbed=True)
                             probe_bit = qc_pert.n_bits - 1
 
                             tag_base = f"N{W}_p{p:.2f}_L{L:03d}_s{_seed}_c{c_idx}_i{i_idx}"
@@ -744,6 +819,7 @@ def sweep_single_shot_disorder(
     device_name: str | None = None,
     optimisation_level: int = 0,
     use_batch: bool = True,
+    circuit_builder=None,
 ) -> dict[int, dict[str, dict[float, dict[int, float]]]]:
     """
     Disorder-averaged sweep where every sample is a fully independent circuit
@@ -797,6 +873,7 @@ def sweep_single_shot_disorder(
     if L_values is None:
         L_values = list(range(record_every, L_max + 1, record_every))
 
+    _build_circuit = circuit_builder if circuit_builder is not None else build_brickwall_otoc_circuit
     _seeds = base_seeds if base_seeds is not None else [base_seed]
     print(f"Seed average over {len(_seeds)} seed(s): {_seeds}")
 
@@ -825,8 +902,8 @@ def sweep_single_shot_disorder(
                             meas_seed=_s(2), meas_seed_ud=_s(3),
                             add_barrier=_add_barrier,
                         )
-                        circuits_pert.append(build_otoc_circuit(**kwargs, unperturbed=False))
-                        circuits_unpert.append(build_otoc_circuit(**kwargs, unperturbed=True))
+                        circuits_pert.append(_build_circuit(**kwargs, unperturbed=False))
+                        circuits_unpert.append(_build_circuit(**kwargs, unperturbed=True))
 
                     probe_bit = circuits_pert[0].n_bits - 1
                     tag = f"N{W}_p{p:.2f}_L{L:03d}_s{_seed}"

@@ -46,7 +46,8 @@ _spec = importlib.util.spec_from_file_location("schmetterling", _src)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
-generate = _mod.build_otoc_circuit
+build_brickwall_otoc_circuit = _mod.build_brickwall_otoc_circuit
+build_bowtie_otoc_circuit   = _mod.build_bowtie_otoc_circuit
 _run_circuits = _mod._run_circuits
 compute_C_t = _mod.compute_C_t
 plot_results = _mod.plot_results
@@ -73,7 +74,7 @@ ButterflyTransferMatrix = _tm_mod.ButterflyTransferMatrix
 #
 DATE = f"{datetime.datetime.now():%Y_%m_%d_%H:%M:%S}"
 P_VALUES = [0.0, 0.01]  # measurement rate threshold
-L_MAX = 20  # max layers
+L_MAX = 25  # max layers
 N_VALUES = [6]  # system sizes (even, 8–16)
 N_REALIZATIONS = 1000  # single-shot mode: independent circuits per (N, p, L)
 N_SHOTS = 100  # multi-shot mode: shots per fixed circuit
@@ -90,11 +91,11 @@ RECORD_EVERY = 4  # record at L = 5, 10, 15, 20
 L_VALUES: list[int] | None = [
     2,
     4,
-    6,
     8,
-    10,
-    20,
+    16,
+    25,
 ]  # explicit L list; overrides L_MAX + RECORD_EVERY when set
+TOPOLOGY = "brickwall"  # "brickwall" or "bowtie"
 PERT_OP = "X"  # perturbation gate
 PROBE_ANGLE = 0.0  # Ry(π/2) on probe qubit
 OPTIMISATION_LEVEL = 0  # pytket compilation level: 0 = minimal, 1 = light, 2 = full
@@ -125,7 +126,7 @@ PARTIALS_DIR = "partials"  # directory for intermediate files
 # ── Transfer-matrix overlay  (set TM_NUM_QUBITS to None to skip entirely) ─────
 TM_NUM_QUBITS: int | None = 6  # None → TM disabled; set to an int to enable
 TM_TF: int = 25  # number of time steps to evolve
-TM_PERT_SITE: int = 2  # perturbation qubit index
+TM_PERT_SITE: int = 3  # perturbation qubit index
 TM_PROBE_SITE: int = 0  # probe qubit index
 TM_P_VALUES: list[float] | None = (
     None  # None → use P_VALUES; or set explicitly e.g. [0.0, 0.02]
@@ -145,6 +146,14 @@ def _L_steps():
     if L_VALUES is not None:
         return sorted(L_VALUES)
     return list(range(RECORD_EVERY, L_MAX + 1, RECORD_EVERY))
+
+
+def _circuit_builder():
+    if TOPOLOGY == "bowtie":
+        return build_bowtie_otoc_circuit
+    if TOPOLOGY == "brickwall":
+        return build_brickwall_otoc_circuit
+    raise ValueError(f"Unknown TOPOLOGY {TOPOLOGY!r}. Choose 'brickwall' or 'bowtie'.")
 
 
 def _build_backend():
@@ -313,8 +322,9 @@ def _compute_partial(
                         meas_seed=meas_seed_val,
                         add_barrier=add_bar,
                     )
-                    qc_pert = generate(**shared, unperturbed=False)
-                    qc_unpert = generate(**shared, unperturbed=True)
+                    _build = _circuit_builder()
+                    qc_pert = _build(**shared, unperturbed=False)
+                    qc_unpert = _build(**shared, unperturbed=True)
                     probe_bit = qc_pert.n_bits - 1
 
                     sp = _run_circuit_backend(qc_pert, backend, N_SHOTS)
@@ -699,6 +709,7 @@ def run_sequential(mode: str = "single_shot") -> None:
             device_name=DEVICE_NAME,
             optimisation_level=OPTIMISATION_LEVEL,
             use_batch=NEXUS_BATCH,
+            circuit_builder=_circuit_builder(),
         )
     elif mode == "multi_shot":
         n_real = N_CIRCUITS * N_INIT_STATES * len(BASE_SEEDS)
@@ -727,6 +738,7 @@ def run_sequential(mode: str = "single_shot") -> None:
             device_name=DEVICE_NAME,
             optimisation_level=OPTIMISATION_LEVEL,
             use_batch=NEXUS_BATCH,
+            circuit_builder=_circuit_builder(),
         )
     else:
         raise ValueError(

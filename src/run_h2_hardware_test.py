@@ -16,7 +16,8 @@ _spec = importlib.util.spec_from_file_location("schmetterling", _src)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
-build_otoc_circuit = _mod.build_otoc_circuit
+_build_brickwall = _mod.build_brickwall_otoc_circuit
+_build_bowtie    = _mod.build_bowtie_otoc_circuit
 _run_circuits = _mod._run_circuits
 compute_C_t = _mod.compute_C_t
 QuantinuumBackend = _mod.QuantinuumBackend
@@ -25,6 +26,7 @@ QuantinuumBackend = _mod.QuantinuumBackend
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
+TOPOLOGY = "brickwall"  # "brickwall" or "bowtie"
 DEVICE_NAME = "H2-2"  # "H2-1" (hardware) or "H2-1E" (emulator)
 NEXUS_PROJECT = "schmetterling-effect"  # Nexus project (created if absent)
 USE_BATCH = (
@@ -48,6 +50,13 @@ FIGURE_PATH = str(FIGURE_DIR / f"h2_test_{DATE}.png")
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    if TOPOLOGY == "bowtie":
+        build_otoc_circuit = _build_bowtie
+    elif TOPOLOGY == "brickwall":
+        build_otoc_circuit = _build_brickwall
+    else:
+        raise ValueError(f"Unknown TOPOLOGY {TOPOLOGY!r}. Choose 'brickwall' or 'bowtie'.")
+
     # QuantinuumBackend is used as a type token; _run_circuits detects it and
     # routes through the Nexus API (upload → compile job → batched execute job).
     backend = QuantinuumBackend(DEVICE_NAME)
